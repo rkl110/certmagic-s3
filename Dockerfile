@@ -7,7 +7,7 @@ WORKDIR /build
 COPY . /build/certmagic-s3/
 
 RUN xcaddy build \
-    --with github.com/techknowlogick/certmagic-s3=/build/certmagic-s3
+    --with github.com/rkl110/certmagic-s3=/build/certmagic-s3
 
 FROM gcr.io/distroless/static-debian12:latest
 

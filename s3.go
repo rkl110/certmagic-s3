@@ -169,6 +169,13 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 	startedAt := time.Now()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if startedAt.Add(LockTimeout).Before(time.Now()) {
+			return errors.New("acquiring lock failed")
+		}
+
 		input := &s3sdk.GetObjectInput{
 			Bucket: aws.String(s3.Bucket),
 			Key:    aws.String(s3.objLockName(key)),
@@ -180,12 +187,18 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 			if errors.As(err, &nsk) {
 				return s3.putLockFile(ctx, key)
 			}
+			if waitErr := sleepOrDone(ctx, LockPollInterval); waitErr != nil {
+				return waitErr
+			}
 			continue
 		}
 
 		buf, err := io.ReadAll(result.Body)
 		_ = result.Body.Close()
 		if err != nil {
+			if waitErr := sleepOrDone(ctx, LockPollInterval); waitErr != nil {
+				return waitErr
+			}
 			continue
 		}
 
@@ -199,10 +212,19 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 			return s3.putLockFile(ctx, key)
 		}
 
-		if startedAt.Add(LockTimeout).Before(time.Now()) {
-			return errors.New("acquiring lock failed")
+		if waitErr := sleepOrDone(ctx, LockPollInterval); waitErr != nil {
+			return waitErr
 		}
-		time.Sleep(LockPollInterval)
+	}
+}
+
+// sleepOrDone waits for d, returning early with ctx.Err() if ctx is canceled first.
+func sleepOrDone(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -364,13 +386,25 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
 	var keys []string
 
+	// basePrefix is stripped from every returned key so that keys stay
+	// relative to the configured storage prefix, without a leading slash.
+	// objName("") already ends in "/" when a prefix is configured, so it
+	// must not be appended again here.
+	basePrefix := s3.objName("")
+
 	fullPrefix := s3.objName(prefix)
-	if prefix != "" {
+	if fullPrefix != "" {
 		fullPrefix += "/"
 	}
+
 	input := &s3sdk.ListObjectsV2Input{
 		Bucket: aws.String(s3.Bucket),
 		Prefix: aws.String(fullPrefix),
+	}
+	if !recursive {
+		// Only enumerate the next path component; deeper keys are folded
+		// into CommonPrefixes instead of being listed individually.
+		input.Delimiter = aws.String("/")
 	}
 
 	paginator := s3sdk.NewListObjectsV2Paginator(s3.Client, input)
@@ -381,9 +415,14 @@ func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string
 		}
 
 		for _, obj := range result.Contents {
-			key := aws.ToString(obj.Key)
-			// Strip the configured prefix from the key before appending
-			keys = append(keys, strings.TrimPrefix(key, s3.objName("")))
+			key := strings.TrimPrefix(aws.ToString(obj.Key), basePrefix)
+			keys = append(keys, key)
+		}
+
+		for _, cp := range result.CommonPrefixes {
+			key := strings.TrimPrefix(aws.ToString(cp.Prefix), basePrefix)
+			key = strings.TrimSuffix(key, "/")
+			keys = append(keys, key)
 		}
 	}
 
@@ -434,17 +473,13 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 	return s3, nil
 }
 
-func parseBool(value string) (bool, error) {
-	return strconv.ParseBool(value)
-}
-
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		key := d.Val()
 		var value string
 
 		if !d.Args(&value) {
-			continue;
+			continue
 		}
 
 		switch key {
@@ -453,7 +488,7 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "endpoint":
 			s3.Endpoint = value
 		case "insecure":
-			parsed, err := parseBool(value)
+			parsed, err := strconv.ParseBool(value)
 			if err != nil {
 				return d.Errf("invalid boolean value for 'insecure': %v", err)
 			}
@@ -478,7 +513,7 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			s3.EncryptionKey = value
 		case "use_path_style":
-			parsed, err := parseBool(value)
+			parsed, err := strconv.ParseBool(value)
 			if err != nil {
 				return d.Errf("invalid boolean value for 'use_path_style': %v", err)
 			}
